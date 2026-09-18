@@ -17,8 +17,26 @@ cat /etc/os-release 2>/dev/null | head -2 || true
 uname -m
 cc --version | head -1
 
-echo "== building libinterpose.so =="
-cc -shared -fPIC -O2 -o "$WORK/libinterpose.so" "$REPO_ROOT/interpose/interpose.c" -ldl || exit 2
+LIB="$WORK/libinterpose.so"
+if [ -n "${INTERPOSE_LIB:-}" ]; then
+    # Use caller-supplied prebuilt artifact and check its ELF machine
+    # matches this machine (e_machine at offset 18: 0x003e x86_64, 0x00b7 aarch64).
+    case "$(uname -m)" in
+        x86_64) want=003e ;;
+        aarch64) want=00b7 ;;
+        *) want=unknown ;;
+    esac
+    got=$(od -An -tx2 -j18 -N2 "${INTERPOSE_LIB}" | tr -d ' \n')
+    if [ "$got" != "$want" ]; then
+        echo "FAIL: INTERPOSE_LIB arch mismatch: ELF machine 0x$got, need 0x$want for $(uname -m)"
+        exit 2
+    fi
+    echo "== using prebuilt INTERPOSE_LIB=${INTERPOSE_LIB} =="
+    cp "${INTERPOSE_LIB}" "$LIB"
+else
+    echo "== building libinterpose.so in-container =="
+    cc -shared -fPIC -O2 -o "$WORK/libinterpose.so" "$REPO_ROOT/interpose/interpose.c" -ldl || exit 2
+fi
 
 stage() { # stage <name> : copy common sources + project files
     name=$1

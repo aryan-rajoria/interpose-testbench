@@ -13,10 +13,10 @@ under QEMU), and build systems.
   `INTERPOSE_LOG` and runs the build command **directly**. No wrapper or
   dispatcher sits in front of `make`/`cmake`/etc. Env inheritance keeps every
   child process (compilers, shell snippets, linker) intercepted.
-- `tests/run_scenario.sh` compiles the shim with the *native* toolchain of the
-  container it runs in, so the ABI (glibc vs musl, x86_64 vs aarch64) always
-  matches, then runs each tiny build-system project and asserts the expected
-  compiler invocations appear in the log.
+- `tests/run_scenario.sh` runs each tiny build-system project and asserts the
+  expected compiler invocations appear in the log. By default it consumes a
+  prebuilt artifact via `INTERPOSE_LIB`; unset, it compiles the shim
+  in-container with the native toolchain instead.
 
 ## Scenarios
 
@@ -32,17 +32,55 @@ under QEMU), and build systems.
 Build systems: `make`, `cmake` (Makefile + Ninja generators), `autotools`,
 `meson`, bare `ninja`.
 
+## Universal artifacts (1 `.so` per CPU architecture)
+
+Exactly two artifacts cover all 36 scenario combinations:
+
+| artifact | built in | covers |
+|---|---|---|
+| `libinterpose-x86_64.so` | alpine (musl) | ubuntu 20.04/22.04/24.04, alpine |
+| `libinterpose-aarch64.so` | alpine/arm64 (musl) | ubuntu 24.04 arm64, alpine arm64 |
+
+Each is built on musl with `-nostdlib`, so it has **no `DT_NEEDED`** and no
+versioned symbol references; its undefined symbols (`exec*`, `snprintf`, ...)
+bind to whichever libc the host process already uses — glibc or musl.
+
+Why a resolver fallback: the real-function lookup normally uses `dlsym`,
+but glibc < 2.34 keeps `dlsym` in `libdl.so.2`, and processes like Ubuntu
+20.04's `cc` and `/bin/sh` don't link it — a plain `dlsym` reference aborts
+those processes with `symbol lookup error` (this is why Bear builds its
+`libexec.so` per target libc and leans on the Rust link line to pull in
+`libdl.so.2` on old glibc). Instead:
+
+- `dlsym` is declared **weak** and the .so is compiled with `-fno-plt`, so
+  the code tests whether it actually resolved before calling it;
+- when it didn't (glibc < 2.34 without libdl), a small built-in resolver
+  walks the loader's `_r_debug` link_map, identifies its own object via
+  `_DYNAMIC`, and scans each later object's `.dynsym`/`.dynstr` via
+  `DT_HASH`/`DT_GNU_HASH` — a `dlsym(RTLD_NEXT)` equivalent with no libdl
+  dependency at all.
+
+`interpose/build.sh` enforces this at build time: zero `DT_NEEDED`, weak
+`dlsym`/`_r_debug` references, and a GOT slot (not a PLT stub) for `dlsym`.
+
+Known limitation: the artifacts don't export `execvpe` (musl has none), so
+`execvpe` callers on glibc run unintercepted; the covered build systems
+don't use it.
+
 ## Run locally
 
 ```sh
-docker build --build-arg BASE_IMAGE=ubuntu:24.04 -f docker/Dockerfile -t interpose:u24 .
-docker run --rm -v "$PWD:/src" -w /src interpose:u24 sh tests/run_scenario.sh
+sh tests/build_artifacts.sh   # builds dist/*.so in alpine containers
+docker build --build-arg BASE_IMAGE=ubuntu:24.04 -f docker/Dockerfile -t interpose:ubuntu-24.04-glibc .
+docker run --rm -v "$PWD:/src" -w /src \
+    -e INTERPOSE_LIB=/src/dist/libinterpose-x86_64.so \
+    interpose:ubuntu-24.04-glibc sh tests/run_scenario.sh
 ```
 
-arm64 scenarios need binfmt handlers registered once on the host:
+arm64 scenarios need binfmt handlers registered once on the host (no host
+qemu install required):
 
 ```sh
-sudo apt-get install -y qemu-user-static
 docker run --privileged --rm tonistiigi/binfmt --install arm64
 ```
 
@@ -51,4 +89,17 @@ docker run --privileged --rm tonistiigi/binfmt --install arm64
 `.github/workflows/pr.yml` runs the full `scenario × build_system` matrix on a
 self-hosted runner for every pull request, and is meant to be a required
 status check before merge.
-# smoke
+
+## Timing
+
+Every run finishes with a **Timing report** job that appends a step summary:
+total wall clock, sum of all job durations, and per-job seconds. Since one
+self-hosted runner executes jobs serially, wall clock ≈ sum of jobs; the two
+numbers diverge only if you register more runner replicas.
+
+From the CLI:
+
+```sh
+gh run view <run-id> --repo aryan-rajoria/interpose-testbench \
+    --json jobs --jq '.jobs[] | [.name, .startedAt, .completedAt]'
+```
