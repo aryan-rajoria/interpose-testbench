@@ -1,0 +1,67 @@
+name: pr-interpose-testbench
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+jobs:
+  interpose:
+    name: ${{ matrix.scenario }} / ${{ matrix.build_system }}
+    runs-on: [self-hosted, Linux, X64]
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario:
+          - ubuntu-20.04-glibc
+          - ubuntu-22.04-glibc
+          - ubuntu-24.04-glibc
+          - alpine-musl
+          - ubuntu-24.04-glibc-arm64
+          - alpine-musl-arm64
+        build_system:
+          - make
+          - cmake-make
+          - cmake-ninja
+          - autotools
+          - meson
+          - ninja
+        include:
+          - scenario: ubuntu-20.04-glibc
+            base_image: ubuntu:20.04
+            platform: linux/amd64
+          - scenario: ubuntu-22.04-glibc
+            base_image: ubuntu:22.04
+            platform: linux/amd64
+          - scenario: ubuntu-24.04-glibc
+            base_image: ubuntu:24.04
+            platform: linux/amd64
+          - scenario: alpine-musl
+            base_image: alpine:latest
+            platform: linux/amd64
+          - scenario: ubuntu-24.04-glibc-arm64
+            base_image: ubuntu:24.04
+            platform: linux/arm64
+          - scenario: alpine-musl-arm64
+            base_image: alpine:latest
+            platform: linux/arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build scenario image
+        run: |
+          docker build --platform ${{ matrix.platform }} \
+            --build-arg BASE_IMAGE=${{ matrix.base_image }} \
+            -f docker/Dockerfile \
+            -t interpose:${{ matrix.scenario }} .
+
+      - name: Run ${{ matrix.build_system }} scenario
+        run: |
+          docker run --rm --platform ${{ matrix.platform }} \
+            -v "$PWD:/src" -w /src \
+            interpose:${{ matrix.scenario }} \
+            sh tests/run_scenario.sh ${{ matrix.build_system }}
+
+      - name: Clean image
+        if: always()
+        run: docker image rm -f interpose:${{ matrix.scenario }} || true

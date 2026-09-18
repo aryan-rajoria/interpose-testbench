@@ -1,0 +1,11 @@
+*.o
+*.so
+hello
+build/
+bmake/
+bninja/
+autom4te.cache/
+configure
+Makefile.in
+aclocal.m4
+.deps/
