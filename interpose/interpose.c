@@ -66,13 +66,17 @@ static void log_call(const char *func, char *const argv[])
 
 /* ---- real function resolution ---- */
 
+/* Resolve the real function. Uses only write() on failure so the .so
+ * can stay free of libc/stdout data-symbol dependencies and be usable
+ * from both glibc and musl processes. */
 static void *real(const char *name)
 {
     void *h = dlsym(RTLD_NEXT, name);
     if (h == NULL) {
-        const char *err = dlerror();
-        fprintf(stderr, "interpose: cannot resolve %s: %s\n", name,
-                err ? err : "unknown");
+        static const char msg[] = "interpose: cannot resolve ";
+        write(STDERR_FILENO, msg, sizeof msg - 1);
+        write(STDERR_FILENO, name, strlen(name));
+        write(STDERR_FILENO, "\n", 1);
         _exit(127);
     }
     return h;

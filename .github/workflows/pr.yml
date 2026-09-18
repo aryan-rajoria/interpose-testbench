@@ -6,8 +6,50 @@ on:
   workflow_dispatch:
 
 jobs:
+  build-artifacts:
+    name: Build prebuilt interposer artifacts
+    runs-on: [self-hosted, Linux, X64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ensure arm64 binfmt (emulated builds)
+        run: docker run --privileged --rm tonistiigi/binfmt --install arm64
+
+      - name: Build artifact-builder images
+        run: |
+          docker build --platform linux/amd64 --build-arg BASE_IMAGE=ubuntu:20.04 \
+            -f docker/Dockerfile -t interpose:ubuntu-20.04-glibc .
+          docker build --platform linux/amd64 --build-arg BASE_IMAGE=alpine:latest \
+            -f docker/Dockerfile -t interpose:alpine-musl .
+          docker build --platform linux/arm64 --build-arg BASE_IMAGE=alpine:latest \
+            -f docker/Dockerfile -t interpose:alpine-musl-arm64 .
+
+      - name: Build the 3 artifacts
+        run: sh tests/build_artifacts.sh
+
+      - name: Sanity-check artifacts
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src interpose:alpine-musl sh -c '
+            if readelf -d dist/libinterpose-musl-x86_64.so | grep -q NEEDED; then
+              echo "FAIL: musl x86_64 artifact must have no DT_NEEDED"; exit 1; fi
+            if readelf -d dist/libinterpose-musl-aarch64.so | grep -q NEEDED; then
+              echo "FAIL: musl aarch64 artifact must have no DT_NEEDED"; exit 1; fi
+            if ! readelf -d dist/libinterpose-glibc-x86_64.so | grep -q "libdl.so.2"; then
+              echo "FAIL: glibc artifact must depend on libdl.so.2"; exit 1; fi
+            echo "artifacts OK"'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: interpose-artifacts
+          path: dist/
+
+      - name: Clean images
+        if: always()
+        run: docker image rm -f interpose:ubuntu-20.04-glibc interpose:alpine-musl interpose:alpine-musl-arm64 || true
+
   interpose:
     name: ${{ matrix.scenario }} / ${{ matrix.build_system }}
+    needs: build-artifacts
     runs-on: [self-hosted, Linux, X64]
     strategy:
       fail-fast: false
@@ -30,23 +72,34 @@ jobs:
           - scenario: ubuntu-20.04-glibc
             base_image: ubuntu:20.04
             platform: linux/amd64
+            artifact: libinterpose-glibc-x86_64.so   # glibc 2.31: dlsym needs libdl
           - scenario: ubuntu-22.04-glibc
             base_image: ubuntu:22.04
             platform: linux/amd64
+            artifact: libinterpose-musl-x86_64.so    # glibc >= 2.34: universal musl artifact
           - scenario: ubuntu-24.04-glibc
             base_image: ubuntu:24.04
             platform: linux/amd64
+            artifact: libinterpose-musl-x86_64.so
           - scenario: alpine-musl
             base_image: alpine:latest
             platform: linux/amd64
+            artifact: libinterpose-musl-x86_64.so
           - scenario: ubuntu-24.04-glibc-arm64
             base_image: ubuntu:24.04
             platform: linux/arm64
+            artifact: libinterpose-musl-aarch64.so
           - scenario: alpine-musl-arm64
             base_image: alpine:latest
             platform: linux/arm64
+            artifact: libinterpose-musl-aarch64.so
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: interpose-artifacts
+          path: dist/
 
       - name: Ensure arm64 binfmt (emulated scenarios)
         if: matrix.platform == 'linux/arm64'
@@ -63,6 +116,7 @@ jobs:
         run: |
           docker run --rm --platform ${{ matrix.platform }} \
             -v "$PWD:/src" -w /src \
+            -e INTERPOSE_LIB=/src/dist/${{ matrix.artifact }} \
             interpose:${{ matrix.scenario }} \
             sh tests/run_scenario.sh ${{ matrix.build_system }}
 
