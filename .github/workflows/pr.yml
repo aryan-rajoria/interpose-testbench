@@ -48,6 +48,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Ensure arm64 binfmt (emulated scenarios)
+        if: matrix.platform == 'linux/arm64'
+        run: docker run --privileged --rm tonistiigi/binfmt --install arm64
+
       - name: Build scenario image
         run: |
           docker build --platform ${{ matrix.platform }} \
