@@ -9,13 +9,24 @@
  * INTERPOSE_LOG) is inherited by children, so every process spawned by
  * the build stays intercepted.
  *
- * Build: cc -shared -fPIC -O2 -o libinterpose.so interpose.c -ldl
+ * One artifact per CPU architecture covers glibc (any version) and musl:
+ * built with -nostdlib, it has no DT_NEEDED, and its libc references
+ * (exec*, snprintf, ...) bind to whichever libc the host process uses.
+ * The real-function lookup normally uses dlsym (declared weak); in
+ * processes that lack it (glibc < 2.34 without libdl, e.g. Ubuntu 20.04
+ * /bin/sh and compiler drivers) it falls back to a small _r_debug/
+ * link_map walker — a dlsym(RTLD_NEXT) replacement with no libdl
+ * dependency at all.
+ *
+ * Build: cc -shared -fPIC -O2 -fno-plt -fno-stack-protector -nostdlib \
+ *            -o libinterpose.so interpose.c      (on musl; see build.sh)
  */
 #define _GNU_SOURCE
-#include <dlfcn.h>
+#include <elf.h>
 #include <fcntl.h>
 #include <stdarg.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -23,6 +34,18 @@
 #include <spawn.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+
+/* musl's elf.h lacks the glibc ElfW/ELF_ST_TYPE conveniences. */
+#ifndef ElfW
+#if __SIZEOF_POINTER__ == 8
+#define ElfW(type) Elf64_##type
+#else
+#define ElfW(type) Elf32_##type
+#endif
+#endif
+#ifndef ELF_ST_TYPE
+#define ELF_ST_TYPE(info) ((info) & 0xf)
+#endif
 
 #define MAX_ARGS 64
 
@@ -66,12 +89,117 @@ static void log_call(const char *func, char *const argv[])
 
 /* ---- real function resolution ---- */
 
+/* dlsym, declared weak so this .so also loads into processes that have
+ * no libdl (glibc < 2.34). Must be compiled with -fno-plt so that
+ * testing the symbol address reads the GOT slot instead of a PLT stub
+ * (an unresolved weak function then reads as NULL instead of crashing). */
+#define RTLD_NEXT ((void *) -1l)
+extern void *dlsym(void *, const char *) __attribute__((weak));
+
+/* First fields of struct link_map / struct r_debug. De-facto stable,
+ * gdb-facing layout shared by glibc and musl dynamic loaders. */
+struct link_map_head {
+    ElfW(Addr) l_addr;   /* load base of the object */
+    char *l_name;        /* object name */
+    ElfW(Dyn) *l_ld;     /* relocated PT_DYNAMIC of the object */
+    struct link_map_head *l_next, *l_lprev;
+};
+struct r_debug_head {
+    int r_version;       /* pads to pointer alignment on LP64 */
+    struct link_map_head *r_map;
+};
+/* _r_debug is the loader-exported struct itself (not a pointer to it):
+ * a mis-typed extern would read r_version+padding as an address. */
+extern struct r_debug_head _r_debug __attribute__((weak));
+extern ElfW(Dyn) _DYNAMIC[];
+
+/* Number of .dynsym entries derivable from a DT_GNU_HASH table. */
+static size_t gnu_hash_nsyms(const uint32_t *h)
+{
+    uint32_t nbuckets = h[0], symoffset = h[1], bloom_size = h[2];
+    const uint32_t *buckets =
+        (const uint32_t *)((const char *)(h + 4) +
+                           (size_t)bloom_size * sizeof(ElfW(Addr)));
+    const uint32_t *chain = buckets + nbuckets;
+    uint32_t last = 0;
+    for (uint32_t i = 0; i < nbuckets; i++)
+        if (buckets[i] > last)
+            last = buckets[i];
+    if (last < symoffset)
+        return symoffset;
+    for (size_t guard = 0; guard < 1u << 20; guard++) {
+        if (chain[last - symoffset] & 1u)
+            return (size_t)last + 1;
+        last++;
+    }
+    return symoffset;
+}
+
+/* Look up a defined STT_FUNC symbol in one loaded object. */
+static void *lookup_in(struct link_map_head *m, const char *name)
+{
+    ElfW(Sym) *symtab = NULL;
+    const char *strtab = NULL;
+    const uint32_t *hash = NULL, *gnuhash = NULL;
+
+    for (ElfW(Dyn) *d = m->l_ld; d->d_tag != DT_NULL; d++) {
+        if (d->d_tag == DT_SYMTAB) symtab = (ElfW(Sym) *)d->d_un.d_ptr;
+        else if (d->d_tag == DT_STRTAB) strtab = (const char *)d->d_un.d_ptr;
+        else if (d->d_tag == DT_HASH) hash = (const uint32_t *)d->d_un.d_ptr;
+        else if (d->d_tag == DT_GNU_HASH) gnuhash = (const uint32_t *)d->d_un.d_ptr;
+    }
+    if (symtab == NULL || strtab == NULL)
+        return NULL;
+
+    size_t nsyms = 0;
+    if (hash != NULL)
+        nsyms = hash[1]; /* DT_HASH: nchain == number of symbols */
+    else if (gnuhash != NULL)
+        nsyms = gnu_hash_nsyms(gnuhash);
+    else
+        return NULL;
+
+    for (size_t i = 0; i < nsyms; i++) {
+        if (symtab[i].st_name == 0 || symtab[i].st_value == 0 ||
+            symtab[i].st_shndx == SHN_UNDEF)
+            continue;
+        if (ELF_ST_TYPE(symtab[i].st_info) != STT_FUNC)
+            continue;
+        if (strcmp(strtab + symtab[i].st_name, name) == 0)
+            return (void *)(m->l_addr + symtab[i].st_value);
+    }
+    return NULL;
+}
+
+/* dlsym(RTLD_NEXT, name) equivalent: find our own object in the
+ * link_map (its l_ld is our _DYNAMIC), then search every later object. */
+static void *resolve_next(const char *name)
+{
+    if ((ElfW(Addr))&_r_debug == 0 || _r_debug.r_map == NULL)
+        return NULL;
+    for (struct link_map_head *m = _r_debug.r_map; m != NULL; m = m->l_next) {
+        if ((ElfW(Addr))m->l_ld == (ElfW(Addr))_DYNAMIC) {
+            for (m = m->l_next; m != NULL; m = m->l_next) {
+                void *p = lookup_in(m, name);
+                if (p != NULL)
+                    return p;
+            }
+            break;
+        }
+    }
+    return NULL;
+}
+
 /* Resolve the real function. Uses only write() on failure so the .so
  * can stay free of libc/stdout data-symbol dependencies and be usable
  * from both glibc and musl processes. */
 static void *real(const char *name)
 {
-    void *h = dlsym(RTLD_NEXT, name);
+    void *h = NULL;
+    if (dlsym != NULL)
+        h = dlsym(RTLD_NEXT, name);
+    else
+        h = resolve_next(name);
     if (h == NULL) {
         static const char msg[] = "interpose: cannot resolve ";
         write(STDERR_FILENO, msg, sizeof msg - 1);

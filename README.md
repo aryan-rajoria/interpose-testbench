@@ -32,45 +32,48 @@ under QEMU), and build systems.
 Build systems: `make`, `cmake` (Makefile + Ninja generators), `autotools`,
 `meson`, bare `ninja`.
 
-## Prebuilt artifacts (3 `.so` files)
+## Universal artifacts (1 `.so` per CPU architecture)
 
-The bench does **not** rebuild the shim per container. One `.so` cannot cover
-glibc *and* musl in general: a glibc-built `.so` carries `DT_NEEDED libc.so.6`
-plus versioned symbol references (`execvp@GLIBC_2.x`) that musl cannot
-satisfy. Bear (our reference) solves this the same way — it builds its
-`libexec.so` **per target libc**, and on glibc < 2.34 relies on its link line
-adding `DT_NEEDED libdl.so.2`, which drags `libdl` (and `dlsym`) into every
-process the library is preloaded into.
+Exactly two artifacts cover all 36 scenario combinations:
 
-We exploit the reverse asymmetry: a `.so` built on musl with **zero
-`DT_NEEDED`** and only unversioned, glibc/musl-overlapping symbols binds its
-`dlsym`/`exec*` references to whichever libc the host process already uses.
-That single artifact works on musl and on glibc >= 2.34 (where `dlsym` moved
-into `libc.so.6`). Only glibc < 2.34 (Ubuntu 20.04) needs the Bear-style
-`-ldl` artifact. Result — 3 artifacts, built once per PR:
+| artifact | built in | covers |
+|---|---|---|
+| `libinterpose-x86_64.so` | alpine (musl) | ubuntu 20.04/22.04/24.04, alpine |
+| `libinterpose-aarch64.so` | alpine/arm64 (musl) | ubuntu 24.04 arm64, alpine arm64 |
 
-| artifact | built in | used by | why |
-|---|---|---|---|
-| `libinterpose-musl-x86_64.so` | alpine | ubuntu 22.04/24.04, alpine | zero DT_NEEDED, binds to host libc |
-| `libinterpose-musl-aarch64.so` | alpine/arm64 | ubuntu 24.04-arm64, alpine-arm64 | same |
-| `libinterpose-glibc-x86_64.so` | ubuntu 20.04 | ubuntu 20.04 | glibc 2.31: `dlsym` lives in `libdl.so.2`, so the artifact must pull it in |
+Each is built on musl with `-nostdlib`, so it has **no `DT_NEEDED`** and no
+versioned symbol references; its undefined symbols (`exec*`, `snprintf`, ...)
+bind to whichever libc the host process already uses — glibc or musl.
 
-Rebuild locally with `sh tests/build_artifacts.sh` (requires the scenario
-images). The CI `build-artifacts` job verifies the musl artifacts have no
-`DT_NEEDED` and the glibc one depends on `libdl.so.2`. Scenario jobs consume
-the mapped artifact via `INTERPOSE_LIB`.
+Why a resolver fallback: the real-function lookup normally uses `dlsym`,
+but glibc < 2.34 keeps `dlsym` in `libdl.so.2`, and processes like Ubuntu
+20.04's `cc` and `/bin/sh` don't link it — a plain `dlsym` reference aborts
+those processes with `symbol lookup error` (this is why Bear builds its
+`libexec.so` per target libc and leans on the Rust link line to pull in
+`libdl.so.2` on old glibc). Instead:
 
-Known limitation: the musl artifacts don't export `execvpe` (musl has none),
-so `execvpe` callers on glibc >= 2.34 run unintercepted; the covered build
-systems don't use it.
+- `dlsym` is declared **weak** and the .so is compiled with `-fno-plt`, so
+  the code tests whether it actually resolved before calling it;
+- when it didn't (glibc < 2.34 without libdl), a small built-in resolver
+  walks the loader's `_r_debug` link_map, identifies its own object via
+  `_DYNAMIC`, and scans each later object's `.dynsym`/`.dynstr` via
+  `DT_HASH`/`DT_GNU_HASH` — a `dlsym(RTLD_NEXT)` equivalent with no libdl
+  dependency at all.
+
+`interpose/build.sh` enforces this at build time: zero `DT_NEEDED`, weak
+`dlsym`/`_r_debug` references, and a GOT slot (not a PLT stub) for `dlsym`.
+
+Known limitation: the artifacts don't export `execvpe` (musl has none), so
+`execvpe` callers on glibc run unintercepted; the covered build systems
+don't use it.
 
 ## Run locally
 
 ```sh
-sh tests/build_artifacts.sh   # builds dist/*.so in the scenario images
+sh tests/build_artifacts.sh   # builds dist/*.so in alpine containers
 docker build --build-arg BASE_IMAGE=ubuntu:24.04 -f docker/Dockerfile -t interpose:ubuntu-24.04-glibc .
 docker run --rm -v "$PWD:/src" -w /src \
-    -e INTERPOSE_LIB=/src/dist/libinterpose-musl-x86_64.so \
+    -e INTERPOSE_LIB=/src/dist/libinterpose-x86_64.so \
     interpose:ubuntu-24.04-glibc sh tests/run_scenario.sh
 ```
 
@@ -86,4 +89,17 @@ docker run --privileged --rm tonistiigi/binfmt --install arm64
 `.github/workflows/pr.yml` runs the full `scenario × build_system` matrix on a
 self-hosted runner for every pull request, and is meant to be a required
 status check before merge.
-# smoke
+
+## Timing
+
+Every run finishes with a **Timing report** job that appends a step summary:
+total wall clock, sum of all job durations, and per-job seconds. Since one
+self-hosted runner executes jobs serially, wall clock ≈ sum of jobs; the two
+numbers diverge only if you register more runner replicas.
+
+From the CLI:
+
+```sh
+gh run view <run-id> --repo aryan-rajoria/interpose-testbench \
+    --json jobs --jq '.jobs[] | [.name, .startedAt, .completedAt]'
+```
