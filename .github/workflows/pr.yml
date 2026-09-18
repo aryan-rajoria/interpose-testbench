@@ -132,11 +132,11 @@ jobs:
           jobs = json.load(open("/tmp/jobs.json"))["jobs"]
           rows = []
           for j in jobs:
-              if not j.get("startedAt") or not j.get("completedAt"):
+              if not j.get("started_at") or not j.get("completed_at"):
                   continue
-              rows.append((j["name"], (ts(j["completedAt"]) - ts(j["startedAt"])).total_seconds(), j["conclusion"]))
-          total = (max(ts(j["completedAt"]) for j in jobs if j.get("completedAt"))
-                   - min(ts(j["startedAt"]) for j in jobs if j.get("startedAt"))).total_seconds()
+              rows.append((j["name"], (ts(j["completed_at"]) - ts(j["started_at"])).total_seconds(), j["conclusion"]))
+          total = (max(ts(j["completed_at"]) for j in jobs if j.get("completed_at"))
+                   - min(ts(j["started_at"]) for j in jobs if j.get("started_at"))).total_seconds()
           run_sum = sum(d for _, d, _ in rows)
           with open(os.environ.get("GITHUB_STEP_SUMMARY", "/dev/stdout"), "a") as f:
               f.write("## Timing report\n\n")
