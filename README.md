@@ -51,3 +51,4 @@ docker run --privileged --rm tonistiigi/binfmt --install arm64
 `.github/workflows/pr.yml` runs the full `scenario × build_system` matrix on a
 self-hosted runner for every pull request, and is meant to be a required
 status check before merge.
+# smoke
