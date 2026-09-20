@@ -18,17 +18,17 @@ jobs:
       - name: Build artifact-builder images
         run: |
           docker build --platform linux/amd64 --build-arg BASE_IMAGE=alpine:latest \
-            -f docker/Dockerfile -t interpose:alpine-musl .
+            -f linux/docker/Dockerfile -t interpose:alpine-musl .
           docker build --platform linux/arm64 --build-arg BASE_IMAGE=alpine:latest \
-            -f docker/Dockerfile -t interpose:alpine-musl-arm64 .
+            -f linux/docker/Dockerfile -t interpose:alpine-musl-arm64 .
 
       - name: Build the 2 universal artifacts
-        run: sh tests/build_artifacts.sh
+        run: sh linux/tests/build_artifacts.sh
 
       - uses: actions/upload-artifact@v4
         with:
           name: interpose-artifacts
-          path: dist/
+          path: linux/dist/
 
       - name: Clean images
         if: always()
@@ -86,7 +86,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: interpose-artifacts
-          path: dist/
+          path: linux/dist/
 
       - name: Ensure arm64 binfmt (emulated scenarios)
         if: matrix.platform == 'linux/arm64'
@@ -96,16 +96,16 @@ jobs:
         run: |
           docker build --platform ${{ matrix.platform }} \
             --build-arg BASE_IMAGE=${{ matrix.base_image }} \
-            -f docker/Dockerfile \
+            -f linux/docker/Dockerfile \
             -t interpose:${{ matrix.scenario }} .
 
       - name: Run ${{ matrix.build_system }} scenario
         run: |
           docker run --rm --platform ${{ matrix.platform }} \
             -v "$PWD:/src" -w /src \
-            -e INTERPOSE_LIB=/src/dist/${{ matrix.artifact }} \
+            -e INTERPOSE_LIB=/src/linux/dist/${{ matrix.artifact }} \
             interpose:${{ matrix.scenario }} \
-            sh tests/run_scenario.sh ${{ matrix.build_system }}
+            sh linux/tests/run_scenario.sh ${{ matrix.build_system }}
 
       - name: Clean image
         if: always()

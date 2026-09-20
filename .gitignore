@@ -9,3 +9,14 @@ configure
 Makefile.in
 aclocal.m4
 .deps/
+
+# windows: build outputs, traces, and the unvendored part of the detours clone
+windows/**/bin/
+windows/**/obj/
+windows/reports/
+windows/vendor/detours/*
+!windows/vendor/detours/README.md
+!windows/vendor/detours/include/
+!windows/vendor/detours/include/**
+!windows/vendor/detours/lib.X64/
+!windows/vendor/detours/lib.X64/detours.lib

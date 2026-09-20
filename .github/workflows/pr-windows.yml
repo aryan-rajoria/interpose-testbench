@@ -1,0 +1,26 @@
+name: pr-interpose-testbench-windows
+
+# NOTE: no [self-hosted, Windows, X64] runner is registered for this repo yet,
+# so this workflow is workflow_dispatch-only and never runs in CI. Once a
+# Windows runner exists: add the pull_request trigger (mirror pr-linux.yml)
+# and make the job a required check. The scenario itself is ready — see
+# windows/tests/run_scenario.cmd and windows/docker/Dockerfile.
+on:
+  workflow_dispatch:
+
+jobs:
+  windows-detours:
+    name: windows-2022-x64 / detours
+    runs-on: [self-hosted, Windows, X64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build scenario image
+        run: docker build -f windows/docker/Dockerfile -t interpose:windows-2022-x64 .
+
+      - name: Run detours scenario
+        run: docker run --rm -v "${PWD}:C:\src" -w C:\src interpose:windows-2022-x64 cmd /c windows\tests\run_scenario.cmd
+
+      - name: Clean image
+        if: always()
+        run: docker image rm -f interpose:windows-2022-x64

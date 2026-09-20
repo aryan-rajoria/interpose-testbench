@@ -6,7 +6,7 @@
 # whichever libc the preloaded process already uses.
 #
 #   docker run --rm --platform linux/amd64 -v "$PWD:/repo" -w /repo \
-#       interpose:alpine-musl sh interpose/build.sh dist/libinterpose-x86_64.so
+#       interpose:alpine-musl sh linux/interpose/build.sh linux/dist/libinterpose-x86_64.so
 #
 # Out: <name> next to this script's cwd.
 set -eu
